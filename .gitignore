@@ -1,0 +1,6 @@
+.claude
+*.pyc
+runs/
+
+weights/
+data/
