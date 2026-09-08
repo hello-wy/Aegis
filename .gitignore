@@ -1,6 +1,14 @@
 .claude
 *.pyc
 runs/
+.venv/
+.env
+.cache/
+outputs/
+Pointnet2_PyTorch/
 
 weights/
 data/
+vis_vq
+vis_joints
+tests/
