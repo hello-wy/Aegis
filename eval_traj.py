@@ -55,7 +55,7 @@ class SMPLX_evalutor():
 
         with torch.no_grad():
             for data in self.test_loader:
-                gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ = data
+                gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ, _ = data
 
                 gazes = gazes.to(self.device)
                 poses_input = poses_input.to(self.device)

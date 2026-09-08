@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .gcn import GCN
-from utils.vis_utils import latent_to_joints,visualize_Scene_wo_color
 from model.base_cross_model import PerceiveEncoder
 from model.pointnet_plus2 import PointNet2SemSegSSGShape, MyFPModule
 from model.base_cross_model import SelfAttentionLayer
@@ -110,6 +108,44 @@ class TrajPredictor(nn.Module):
 
         return ori, trans
 
+
+class SemanticPrototypeBank(nn.Module):
+    def __init__(self, feature_dim, num_classes, prototypes_per_class, latent_dim=32, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.query = nn.Linear(feature_dim, latent_dim)
+        self.prototypes = nn.Parameter(
+            torch.randn(num_classes, prototypes_per_class, latent_dim) * 0.02
+        )
+
+    def forward(self, feature, semantic_logits):
+        query = F.normalize(self.query(feature), dim=-1)
+        prototypes = F.normalize(self.prototypes, dim=-1)
+        similarity = torch.einsum('btd,ckd->btck', query, prototypes) / self.temperature
+        within_class = F.softmax(similarity, dim=-1)
+        class_probability = F.softmax(semantic_logits, dim=-1).unsqueeze(-1)
+        weights = class_probability * within_class
+        return torch.einsum('btck,ckd->btd', weights, self.prototypes)
+
+
+class PoseResidualRefiner(nn.Module):
+    def __init__(self, feature_dim, scene_dim, num_joints=23):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(63 + feature_dim * 2 + scene_dim + num_joints, feature_dim),
+            nn.GELU(),
+            nn.Linear(feature_dim, 63),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, coarse_pose, motion_feature, scene_feature, gaze_feature, contact_logits):
+        context = torch.cat(
+            [coarse_pose, motion_feature, scene_feature, gaze_feature, contact_logits.sigmoid()], dim=-1
+        )
+        return self.net(context)
+
+
 class AEGIS(nn.Module):
     def __init__(self, config, vposer, smplx_model):
         super().__init__()
@@ -122,6 +158,10 @@ class AEGIS(nn.Module):
         
         self.vposer = vposer
         self.smplx_model = smplx_model
+        for parameter in self.vposer.parameters():
+            parameter.requires_grad = False
+        for parameter in self.smplx_model.parameters():
+            parameter.requires_grad = False
 
         self.extractor = HumanGazeSceneUpSample(config)
         self.pointnet = PointNet2SemSegSSGShape({'feat_dim': config.scene_feats_dim})
@@ -145,8 +185,33 @@ class AEGIS(nn.Module):
         
         self.sca_blocks = nn.ModuleList([SCABlock(config.motion_latent_dim, num_head=4) for _ in range(1)])
         self.pose_fc = nn.Linear(config.motion_latent_dim, 32)
+        self.semantic_head = nn.Linear(config.motion_latent_dim, config.num_semantic_classes)
+        self.contact_head = nn.Linear(config.motion_latent_dim, 23)
+        self.prototype_bank = SemanticPrototypeBank(
+            config.motion_latent_dim,
+            config.num_semantic_classes,
+            config.prototypes_per_class,
+            temperature=config.prototype_temperature,
+        )
+        self.prototype_fusion = nn.Sequential(
+            nn.Linear(64, config.motion_latent_dim),
+            nn.GELU(),
+            nn.Linear(config.motion_latent_dim, 32),
+        )
+        self.prototype_gate = nn.Parameter(torch.zeros(()))
+        self.gaze_context = nn.Sequential(
+            nn.Linear(config.input_seq_len * 3, config.motion_latent_dim),
+            nn.GELU(),
+        )
+        self.pose_refiner = PoseResidualRefiner(
+            config.motion_latent_dim, config.scene_feats_dim
+        )
 
-        self.motion_decoder = GCN(config, node_n=69)
+    def train(self, mode=True):
+        super().train(mode)
+        self.vposer.eval()
+        self.smplx_model.eval()
+        return self
     
     def load_ckpts(self):
         state_dict = torch.load(self.config.traj_ckpts)
@@ -179,6 +244,37 @@ class AEGIS(nn.Module):
         for block in self.sca_blocks:
             out = block(out, scene_feats, spatial_prior)
         return out.clone()
+
+    def _fuse_semantic_prior(self, feature, z_base, semantic_logits):
+        z_prior = self.prototype_bank(feature, semantic_logits)
+        delta = self.prototype_fusion(torch.cat([z_base, z_prior], dim=-1))
+        return z_base + torch.tanh(self.prototype_gate) * delta, z_prior
+
+    def _decode_refined_joints(self, latent_full, future_feature, scene_feature, gaze_feature, contact_logits):
+        batch_size, sequence_length, _ = latent_full.shape
+        coarse_pose = self.vposer.decode(latent_full[..., 6:], output_type='aa').reshape(
+            batch_size, sequence_length, 63
+        )
+        future_coarse = coarse_pose[:, self.input_seq_len:]
+        pose_delta = self.pose_refiner(
+            future_coarse, future_feature, scene_feature, gaze_feature, contact_logits
+        ).reshape(batch_size, self.output_seq_len, 21, 3)
+        coarse_matrix = axis_angle_to_matrix(
+            future_coarse.reshape(batch_size, self.output_seq_len, 21, 3)
+        )
+        refined_future = matrix_to_axis_angle(
+            torch.matmul(axis_angle_to_matrix(pose_delta), coarse_matrix)
+        ).reshape(batch_size, self.output_seq_len, 63)
+        refined_pose = torch.cat([coarse_pose[:, :self.input_seq_len], refined_future], dim=1)
+
+        smplx_output = self.smplx_model(
+            return_verts=True,
+            body_pose=refined_pose.reshape(-1, 63),
+            global_orient=latent_full[..., :3].reshape(-1, 3),
+            transl=latent_full[..., 3:6].reshape(-1, 3),
+            pose_embedding=latent_full[..., 6:].reshape(-1, 32),
+        )
+        return smplx_output.joints.reshape(batch_size, sequence_length, -1, 3)[..., :23, :]
     
     def combine_smplx_rt(
         self,
@@ -209,11 +305,11 @@ class AEGIS(nn.Module):
 
         return final_trans, final_orient
 
-    def forward(self, motions, joints, scene_xyz, gazes,occ):
+    def forward(self, motions, joints, scene_xyz, gazes, occ, return_aux=False):
         """
         :param motions: (bs, seq_len, motion_dim)       [ori, trans, latent] dim:38
         :param scene_xyz: (bs, n, 3)
-        :param gazes: unused; kept for compatibility with existing dataloaders/scripts
+        :param gazes: observed gaze points, (bs, input_seq_len, 1, 3)
         :return:
         """
         B, _, J, C = joints.shape
@@ -225,11 +321,19 @@ class AEGIS(nn.Module):
         motions_cat = torch.cat([motions, motion_extend], dim=1)        #B，16，69 + 38
 
         human_points = self.extractor.cut_by_step(scene_xyz, trans, self.out_unit, ori)      # B,10 // unit,N,3
-        scene_feats_batch = self._extract_scene_features(human_points.view(B * self.output_seq_len // self.out_unit, -1, 3))        # [B, num_points, feat_dim]
-        scene_feats_batch = scene_feats_batch.view(B, self.output_seq_len // self.out_unit, -1, self.config.scene_feats_dim)
+        scene_feats_batch = self._extract_scene_features(
+            human_points.reshape(B * self.output_seq_len // self.out_unit, -1, 3)
+        )
+        scene_feats_batch = scene_feats_batch.reshape(
+            B, self.output_seq_len // self.out_unit, -1, self.config.scene_feats_dim
+        )
         # scene_feats = self._extract_scene_features(scene_xyz) 
         # print(scene_feats_batch.shape)
         latent_full = motions_cat.clone()
+        future_features = []
+        future_scene_features = []
+        semantic_logits = []
+        contact_logits = []
         for step in range(self.output_seq_len // self.out_unit):
             scene_feats = scene_feats_batch[:, step]
             
@@ -239,23 +343,48 @@ class AEGIS(nn.Module):
             #scene_xyz_normalized = human_centered_scene(human_points[:, step],ori[:, start:end],trans[:,start:end])          # bs * len * N * 3
             spatial_prior = self._compute_spatial_prior(human_points[:, step])
             out_sca = self._apply_sca_blocks(motions, scene_feats, spatial_prior)
-            pose = self.pose_fc(out_sca)
+            block_feature = out_sca[:, -self.out_unit:]
+            z_base = self.pose_fc(block_feature)
+            block_semantic_logits = self.semantic_head(block_feature)
+            pose, _ = self._fuse_semantic_prior(block_feature, z_base, block_semantic_logits)
+            block_contact_logits = self.contact_head(block_feature)
+
+            future_features.append(block_feature)
+            future_scene_features.append(
+                scene_feats.mean(dim=1, keepdim=True).expand(-1, self.out_unit, -1)
+            )
+            semantic_logits.append(block_semantic_logits)
+            contact_logits.append(block_contact_logits)
             
-            latent_pred = torch.cat([ori[:, start:end], trans[:, start:end], pose], dim=-1) 
+            latent_pred = torch.cat(
+                [ori[:, end - self.out_unit:end], trans[:, end - self.out_unit:end], pose], dim=-1
+            )
             # Keep the full sequence length fixed; only replace the current future block.
             latent_full = torch.cat(
-                [latent_full[:, :end - self.out_unit], latent_pred[:, -self.out_unit :], latent_full[:, end:]],
+                [latent_full[:, :end - self.out_unit], latent_pred, latent_full[:, end:]],
                 dim=1,
             )
-          
-        recons_joints = latent_to_joints(latent_full, self.vposer, self.smplx_model)[:, :, :23]
-        recons_joints = torch.cat([joints, recons_joints[:, 6:]], dim=1).clone()
-        pred_joints = recons_joints[:, :, :23]
+
+        future_feature = torch.cat(future_features, dim=1)
+        future_scene_feature = torch.cat(future_scene_features, dim=1)
+        semantic_logits = torch.cat(semantic_logits, dim=1)
+        contact_logits = torch.cat(contact_logits, dim=1)
+        gaze_feature = self.gaze_context(gazes.reshape(B, -1)).unsqueeze(1).expand(
+            -1, self.output_seq_len, -1
+        )
+        recons_joints = self._decode_refined_joints(
+            latent_full, future_feature, future_scene_feature, gaze_feature, contact_logits
+        )
+        pred_joints = torch.cat([joints, recons_joints[:, self.input_seq_len:]], dim=1)
         
         if self.config.traj_fusion:    
             pred_joints = self.pose_traj_fusion(trans.unsqueeze(2), pred_joints)
-            
-        pred_joints = self.motion_decoder(pred_joints)
+
+        if return_aux:
+            return latent_full, pred_joints, {
+                'semantic_logits': semantic_logits,
+                'contact_logits': contact_logits,
+            }
         return latent_full, pred_joints
         
     def pose_traj_fusion(self, traj, joints):

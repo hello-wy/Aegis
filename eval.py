@@ -45,7 +45,7 @@ class SMPLX_evalutor():
             model.eval()
             test_metrics = MetricTracker('loss_trans', 'loss_des_trans', 'mpjpe', 'des_mpjpe')
             for i, data in enumerate(self.test_loader):
-                gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ = data
+                gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ, _ = data
                 gazes = gazes.to(self.device)
                 poses_input = poses_input.to(self.device)
                 poses_label = poses_label.to(self.device)

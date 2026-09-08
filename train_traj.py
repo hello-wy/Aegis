@@ -107,7 +107,7 @@ class SMPLX_evalutor():
         self.model.train(is_train)
 
         for data in tqdm(dataloader, dynamic_ncols=True):
-            gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ = data
+            gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occ, _ = data
 
             gazes = gazes.to(self.device)
             poses_input = poses_input.to(self.device)

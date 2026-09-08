@@ -12,6 +12,17 @@ from human_body_prior.tools.model_loader import load_vposer
 from scipy.spatial.transform import Rotation
 from torchvision import transforms
 
+
+def parse_semantic_labels(row, token_count):
+    value = row.get('token_motion_label')
+    if pd.isna(value):
+        return torch.full((token_count,), int(row['motion_label']), dtype=torch.long)
+    labels = [int(label.strip()) for label in str(value).split(',')]
+    if len(labels) != token_count:
+        raise ValueError(f"Expected {token_count} semantic token labels, got {len(labels)}: {value!r}")
+    return torch.tensor(labels, dtype=torch.long)
+
+
 class EgoEvalDataset(data.Dataset):
     def __init__(self, config, train=False):
         # folder = "SLICES_888s"
@@ -31,6 +42,7 @@ class EgoEvalDataset(data.Dataset):
         self.trans_path_list = []
         self.poses_path_list = []
         self.start_end_list = []
+        self.semantic_labels = []
         self.use_sdf = True
 
         self.dataset_info = pd.read_csv(os.path.join(self.dataroot, config.dataset_csv+'.csv'))
@@ -121,7 +133,10 @@ class EgoEvalDataset(data.Dataset):
                 joints_label_np = joints_label[f].numpy()  # [J, 3]
                 joints_label[f] = torch.from_numpy((random_rotation @ joints_label_np.T).T).float()
 
-        return gazes, poses_input, poses_label, joints_input, joints_label, scene_points, seq, scene, occupancy_map
+        return (
+            gazes, poses_input, poses_label, joints_input, joints_label,
+            scene_points, seq, scene, occupancy_map, self.semantic_labels[index],
+        )
 
     def __len__(self):
         return len(self.poses_path_list)
@@ -140,6 +155,9 @@ class EgoEvalDataset(data.Dataset):
             self.scenes_path_list.append(scene)
             self.trans_path_list.append(transform)
             self.start_end_list.append([self.dataset_info['start_frame'][i], self.dataset_info['end_frame'][i]])
+            self.semantic_labels.append(
+                parse_semantic_labels(self.dataset_info.iloc[i], self.output_seq_len // self.config.out_unit)
+            )
 
     def _get_raw_item(self, index):
         ego_idx = self.poses_path_list[index]
