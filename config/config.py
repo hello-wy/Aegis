@@ -46,7 +46,7 @@ class MotionFromGazeConfig(ArgumentParser):
 
         self.eval_configs = self.add_argument_group('eval')
         self.eval_configs.add_argument('--output_path', default='results', type=str)
-        self.eval_configs.add_argument('--smplx_path', default='./data', type=str)
+        self.eval_configs.add_argument('--smplx_path', default='/data/wuyang/smpl_model', type=str)
         self.eval_configs.add_argument('--vposer_path', default='vposer_v1_0', type=str)
         self.eval_configs.add_argument('--modelName', default='', type=str)
         self.eval_configs.add_argument('--traj_ckpts', default='/data/wuyang/output/traj_ckpts/best.pth', type=str)
