@@ -70,7 +70,6 @@ class SMPLX_evalutor():
         if not os.path.exists(config.save_path):
             os.makedirs(config.save_path, exist_ok=True)
         self.logger = create_logger(config.save_path)
-        os.makedirs(f"runs/{self.config.save_path}", exist_ok=True)
 
     def train(self):
         train_metrics = MetricTracker('loss_trans', 'loss_des_trans', 'mpjpe', 'des_mpjpe')
